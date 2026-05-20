@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    container_name: gp-itbot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./prompts:/app/prompts
+    restart: unless-stopped

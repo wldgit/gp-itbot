@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gp-itbot-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gp_itbot_logs}
+      POSTGRES_USER: ${POSTGRES_USER:-gp_itbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gp_itbot_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gp_itbot} -d ${POSTGRES_DB:-gp_itbot_logs}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    container_name: gp-itbot
+    env_file:
+      - .env
+    environment:
+      LOG_BACKEND: postgres
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./prompts:/app/prompts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
