@@ -24,7 +24,8 @@ def main() -> None:
     rows = service.debug_search_context(question)
 
     print(f"Question: {question}")
-    print(f"MIN_RELEVANCE_SCORE: {settings.min_relevance_score}")
+    print(f"RAG_MIN_SCORE: {settings.rag_min_score}")
+    print(f"RAG_CONFIDENT_SCORE: {settings.rag_confident_score}")
     print(f"TOP_K: {settings.top_k}")
     print(f"Results: {len(rows)}\n")
 

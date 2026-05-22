@@ -87,6 +87,13 @@ def format_escalation_send_failed() -> str:
     )
 
 
+def format_no_direct_answer_fallback() -> str:
+    return (
+        "Я не нашел подходящую инструкцию в базе знаний по этому вопросу. "
+        "Рекомендую обратиться в ИТ-поддержку через /support."
+    )
+
+
 def format_no_context_fallback() -> str:
     contact_lines = _support_contact_lines()
     contacts_block = "\n".join(contact_lines) if contact_lines else "Контакты поддержки не настроены."

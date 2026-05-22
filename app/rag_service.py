@@ -1,6 +1,8 @@
+import json
+import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import chromadb
 from openai import OpenAI
@@ -9,8 +11,21 @@ from app.app_logger import logger
 from app.config import settings
 from app.logging_service import log_runtime_event
 from app.prompt_loader import load_system_prompt
-from app.support_messages import format_no_context_fallback
+from app.support_messages import format_no_context_fallback, format_no_direct_answer_fallback
 from app.text_safety import mask_sensitive_data
+
+RetrievalQuality = Literal["no_context", "borderline", "confident"]
+
+GROUNDEDNESS_SYSTEM_PROMPT = """Определи, содержит ли контекст прямой ответ на вопрос пользователя.
+Прямой ответ означает, что в контексте явно описана нужная проблема, технология или процедура.
+Если контекст только похож по общей теме, но не содержит прямой инструкции, верни has_direct_answer=false.
+Не используй общие знания.
+
+Верни только JSON без пояснений и без Markdown:
+{
+  "has_direct_answer": true,
+  "reason": "коротко"
+}"""
 
 
 @dataclass
@@ -19,6 +34,17 @@ class RagAnswer:
     sources: list[str]
     found_context: bool
     response_time_ms: int
+
+
+@dataclass
+class RetrievalOutcome:
+    contexts: list[str]
+    sources: list[str]
+    accepted_results: list[dict[str, Any]]
+    accepted_count: int
+    best_score: float
+    quality: RetrievalQuality
+    retrieval_results: list[dict[str, Any]]
 
 
 def dedupe_sources(sources: list[str]) -> list[str]:
@@ -118,7 +144,7 @@ def filter_chunks_by_relevance(
     distances: list[float | None],
     threshold: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    min_score = settings.min_relevance_score if threshold is None else threshold
+    min_score = settings.rag_min_score if threshold is None else threshold
     accepted_results: list[dict[str, Any]] = []
     rejected_results: list[dict[str, Any]] = []
 
@@ -160,6 +186,46 @@ def filter_chunks_by_relevance(
 
     accepted_results.sort(key=lambda item: item["relevance_score"], reverse=True)
     return accepted_results, rejected_results
+
+
+def evaluate_retrieval_quality(
+    accepted_results: list[dict[str, Any]],
+) -> tuple[RetrievalQuality, float]:
+    """Accepted chunks are already >= RAG_MIN_SCORE."""
+    if not accepted_results:
+        return "no_context", 0.0
+
+    best_score = max(item["relevance_score"] for item in accepted_results)
+    if best_score >= settings.rag_confident_score:
+        return "confident", best_score
+    return "borderline", best_score
+
+
+def parse_groundedness_response(raw: str) -> tuple[bool, str]:
+    if not raw or not raw.strip():
+        return False, "empty response"
+
+    text = raw.strip()
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+        if match:
+            text = match.group(1)
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            return False, "invalid JSON"
+        try:
+            payload = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return False, "invalid JSON"
+
+    has_direct = bool(payload.get("has_direct_answer", False))
+    reason = str(payload.get("reason", "")).strip() or "no reason"
+    return has_direct, reason
 
 
 def format_context_for_model(item: dict[str, Any]) -> str:
@@ -222,74 +288,122 @@ class RagService:
         distances = result.get("distances", [[]])[0] or []
         return docs, metadatas, distances
 
-    def search_context(self, question: str) -> tuple[list[str], list[str], bool]:
+    def _retrieve(self, question: str) -> RetrievalOutcome:
         started = time.monotonic()
 
-        try:
-            docs, metadatas, distances = self._query_chroma(question)
-            threshold = settings.min_relevance_score
-            accepted_results, rejected_results = filter_chunks_by_relevance(
-                docs, metadatas, distances, threshold=threshold
-            )
-            retrieval_results = build_retrieval_results_for_log(
-                docs, metadatas, distances, threshold
-            )
+        docs, metadatas, distances = self._query_chroma(question)
+        min_score = settings.rag_min_score
+        accepted_results, rejected_results = filter_chunks_by_relevance(
+            docs, metadatas, distances, threshold=min_score
+        )
+        retrieval_results = build_retrieval_results_for_log(
+            docs, metadatas, distances, min_score
+        )
 
-            logger.info(
-                "RAG retrieval completed. raw_results=%s accepted=%s rejected=%s min_relevance_score=%.3f",
+        accepted_count = len(accepted_results)
+        sources = dedupe_sources([item["source"] for item in accepted_results])
+        quality, best_score = evaluate_retrieval_quality(accepted_results)
+        contexts = [format_context_for_model(item) for item in accepted_results]
+        elapsed = int((time.monotonic() - started) * 1000)
+
+        logger.info(
+            "RAG retrieval completed. mode=%s raw_results=%s accepted=%s rejected=%s "
+            "RAG_MIN_SCORE=%.3f RAG_CONFIDENT_SCORE=%.3f best_score=%.3f sources=%s",
+            quality,
+            len(docs),
+            accepted_count,
+            len(rejected_results),
+            min_score,
+            settings.rag_confident_score,
+            best_score,
+            sources,
+        )
+
+        if len(docs) > 0 and accepted_count == 0:
+            logger.warning(
+                "RAG no_context: all chunks below RAG_MIN_SCORE. raw_results=%s threshold=%.3f",
                 len(docs),
-                len(accepted_results),
-                len(rejected_results),
-                threshold,
+                min_score,
             )
 
-            if len(docs) > 0 and len(accepted_results) == 0:
-                logger.warning(
-                    "RAG search returned chunks, but all were below relevance threshold. "
-                    "raw_results=%s threshold=%.3f",
-                    len(docs),
-                    threshold,
-                )
+        log_runtime_event(
+            "INFO",
+            "rag_search_completed",
+            "RAG search completed",
+            {
+                "mode": quality,
+                "best_score": best_score,
+                "accepted_count": accepted_count,
+                "raw_chunks": len(docs),
+                "accepted_chunks": accepted_count,
+                "rejected_chunks": len(rejected_results),
+                "rag_min_score": min_score,
+                "rag_confident_score": settings.rag_confident_score,
+                "accepted_sources": sources,
+                "retrieval_results": retrieval_results,
+                "elapsed_ms": elapsed,
+            },
+        )
 
-            contexts = [format_context_for_model(item) for item in accepted_results]
-            sources = dedupe_sources([item["source"] for item in accepted_results])
-            found = len(accepted_results) > 0
-            elapsed = int((time.monotonic() - started) * 1000)
+        return RetrievalOutcome(
+            contexts=contexts,
+            sources=sources,
+            accepted_results=accepted_results,
+            accepted_count=accepted_count,
+            best_score=best_score,
+            quality=quality,
+            retrieval_results=retrieval_results,
+        )
 
-            logger.info(
-                "RAG search completed. found=%s, chunks=%s, elapsed_ms=%s, sources=%s",
-                found,
-                len(contexts),
-                elapsed,
-                sources,
-            )
-            log_runtime_event(
-                "INFO",
-                "rag_search_completed",
-                "RAG search completed",
-                {
-                    "found": found,
-                    "raw_chunks": len(docs),
-                    "accepted_chunks": len(accepted_results),
-                    "rejected_chunks": len(rejected_results),
-                    "min_relevance_score": threshold,
-                    "accepted_sources": sources,
-                    "retrieval_results": retrieval_results,
-                    "elapsed_ms": elapsed,
-                },
-            )
-            return contexts, sources, found
-
+    def search_context(self, question: str) -> tuple[list[str], list[str], bool]:
+        try:
+            outcome = self._retrieve(question)
+            found = outcome.quality == "confident"
+            return outcome.contexts, outcome.sources, found
         except Exception as exc:
-            elapsed = int((time.monotonic() - started) * 1000)
-            logger.exception("RAG search failed. elapsed_ms=%s", elapsed)
-            log_runtime_event(
-                "ERROR",
-                "rag_search_failed",
-                str(exc),
-                {"elapsed_ms": elapsed},
-            )
+            logger.exception("RAG search failed.")
+            log_runtime_event("ERROR", "rag_search_failed", str(exc), {})
             raise
+
+    def _check_context_groundedness(
+        self,
+        question: str,
+        contexts: list[str],
+    ) -> tuple[bool, str]:
+        context_block = "\n\n---\n\n".join(contexts)
+        user_prompt = f"""Вопрос пользователя:
+{mask_sensitive_data(question)}
+
+Контекст из базы знаний:
+{context_block}
+"""
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[
+                    {"role": "system", "content": GROUNDEDNESS_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or ""
+            return parse_groundedness_response(raw)
+        except Exception as exc:
+            err = str(exc).lower()
+            if "response_format" in err or "unsupported" in err:
+                response = self.openai_client.chat.completions.create(
+                    model=settings.openai_model,
+                    messages=[
+                        {"role": "system", "content": GROUNDEDNESS_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0,
+                )
+                raw = response.choices[0].message.content or ""
+                return parse_groundedness_response(raw)
+            logger.exception("Groundedness check failed")
+            return False, str(exc)
 
     def debug_search_context(self, question: str) -> list[dict[str, Any]]:
         docs, metadatas, distances = self._query_chroma(question)
@@ -328,11 +442,20 @@ class RagService:
         history: list[dict[str, str]] | None = None,
     ) -> RagAnswer:
         started = time.monotonic()
-        contexts, sources, found_context = self.search_context(question)
 
-        if not found_context:
+        try:
+            outcome = self._retrieve(question)
+        except Exception:
+            raise
+
+        if outcome.quality == "no_context":
             elapsed = int((time.monotonic() - started) * 1000)
-            logger.info("No context found for question. elapsed_ms=%s", elapsed)
+            logger.info(
+                "RAG no_context. best_score=%.3f RAG_MIN_SCORE=%.3f elapsed_ms=%s",
+                outcome.best_score,
+                settings.rag_min_score,
+                elapsed,
+            )
             return RagAnswer(
                 answer=format_no_context_fallback(),
                 sources=[],
@@ -340,6 +463,54 @@ class RagService:
                 response_time_ms=elapsed,
             )
 
+        if outcome.quality == "borderline":
+            has_direct, reason = self._check_context_groundedness(question, outcome.contexts)
+            logger.info(
+                "RAG borderline groundedness. has_direct_answer=%s best_score=%.3f "
+                "RAG_MIN_SCORE=%.3f RAG_CONFIDENT_SCORE=%.3f sources=%s reason=%s",
+                has_direct,
+                outcome.best_score,
+                settings.rag_min_score,
+                settings.rag_confident_score,
+                outcome.sources,
+                reason,
+            )
+            if not has_direct:
+                elapsed = int((time.monotonic() - started) * 1000)
+                log_runtime_event(
+                    "INFO",
+                    "rag_borderline_rejected",
+                    "Borderline RAG context rejected by groundedness check",
+                    {
+                        "mode": "no_context",
+                        "has_direct_answer": False,
+                        "best_score": outcome.best_score,
+                        "sources": outcome.sources,
+                        "reason": reason,
+                        "elapsed_ms": elapsed,
+                    },
+                )
+                return RagAnswer(
+                    answer=format_no_direct_answer_fallback(),
+                    sources=[],
+                    found_context=False,
+                    response_time_ms=elapsed,
+                )
+            log_runtime_event(
+                "INFO",
+                "rag_borderline_accepted",
+                "Borderline RAG context passed groundedness check",
+                {
+                    "mode": "borderline",
+                    "has_direct_answer": True,
+                    "best_score": outcome.best_score,
+                    "sources": outcome.sources,
+                    "reason": reason,
+                },
+            )
+
+        contexts = outcome.contexts
+        sources = outcome.sources
         context_block = "\n\n---\n\n".join(contexts)
         user_prompt = f"""Вопрос пользователя:
 {mask_sensitive_data(question)}
@@ -347,7 +518,7 @@ class RagService:
 Найденные фрагменты базы знаний:
 {context_block}
 
-Сформируй ответ для пользователя.
+Сформируй ответ для пользователя только на основе этих фрагментов.
 """
 
         prior: list[dict[str, str]] = list(history or [])

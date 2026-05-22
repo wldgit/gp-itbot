@@ -42,7 +42,10 @@ class Settings:
     recreate_chroma_collection: bool = _env_bool("RECREATE_CHROMA_COLLECTION", True)
     docs_path: str = _resolve_path(os.getenv("DOCS_PATH", ""), "./data/docs")
     top_k: int = int(os.getenv("TOP_K", "4"))
-    min_relevance_score: float = float(os.getenv("MIN_RELEVANCE_SCORE", "0.25"))
+    rag_min_score: float = float(
+        os.getenv("RAG_MIN_SCORE", os.getenv("MIN_RELEVANCE_SCORE", "0.35"))
+    )
+    rag_confident_score: float = float(os.getenv("RAG_CONFIDENT_SCORE", "0.55"))
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "800"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "150"))
 

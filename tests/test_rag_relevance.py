@@ -1,12 +1,56 @@
 import unittest
 
+from unittest.mock import patch
+
 from app.rag_service import (
     append_sources_to_answer,
     chunk_text_preview,
     dedupe_sources,
     distance_to_relevance_score,
+    evaluate_retrieval_quality,
     filter_chunks_by_relevance,
+    parse_groundedness_response,
 )
+
+
+class EvaluateRetrievalQualityTests(unittest.TestCase):
+    @patch("app.rag_service.settings")
+    def test_no_chunks_after_min_filter(self, mock_settings):
+        mock_settings.rag_confident_score = 0.55
+        quality, best = evaluate_retrieval_quality([])
+        self.assertEqual(quality, "no_context")
+        self.assertEqual(best, 0.0)
+
+    @patch("app.rag_service.settings")
+    def test_confident(self, mock_settings):
+        mock_settings.rag_confident_score = 0.55
+        items = [{"relevance_score": 0.6}, {"relevance_score": 0.48}]
+        quality, best = evaluate_retrieval_quality(items)
+        self.assertEqual(quality, "confident")
+        self.assertAlmostEqual(best, 0.6)
+
+    @patch("app.rag_service.settings")
+    def test_borderline_between_min_and_confident(self, mock_settings):
+        mock_settings.rag_confident_score = 0.55
+        items = [{"relevance_score": 0.47}, {"relevance_score": 0.36}]
+        quality, best = evaluate_retrieval_quality(items)
+        self.assertEqual(quality, "borderline")
+        self.assertAlmostEqual(best, 0.47)
+
+
+class ParseGroundednessResponseTests(unittest.TestCase):
+    def test_direct_answer_true(self):
+        has_direct, reason = parse_groundedness_response(
+            '{"has_direct_answer": true, "reason": "есть шаги BitLocker"}'
+        )
+        self.assertTrue(has_direct)
+        self.assertIn("BitLocker", reason)
+
+    def test_direct_answer_false(self):
+        has_direct, _ = parse_groundedness_response(
+            '{"has_direct_answer": false, "reason": "только блокировка аккаунта"}'
+        )
+        self.assertFalse(has_direct)
 
 
 class DedupeSourcesTests(unittest.TestCase):
