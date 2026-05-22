@@ -1,6 +1,53 @@
 import unittest
 
-from app.rag_service import distance_to_relevance_score, filter_chunks_by_relevance
+from app.rag_service import (
+    append_sources_to_answer,
+    chunk_text_preview,
+    dedupe_sources,
+    distance_to_relevance_score,
+    filter_chunks_by_relevance,
+)
+
+
+class DedupeSourcesTests(unittest.TestCase):
+    def test_removes_duplicates_preserves_order(self):
+        self.assertEqual(
+            dedupe_sources(["vpn.md", "faq.txt", "vpn.md"]),
+            ["vpn.md", "faq.txt"],
+        )
+
+    def test_skips_empty_values(self):
+        self.assertEqual(dedupe_sources(["a.md", "", "  ", "a.md"]), ["a.md"])
+
+
+class AppendSourcesToAnswerTests(unittest.TestCase):
+    def test_empty_sources_returns_answer_unchanged(self):
+        self.assertEqual(append_sources_to_answer("Ответ.", []), "Ответ.")
+
+    def test_appends_sources_block(self):
+        result = append_sources_to_answer(
+            "Шаги выполнены.",
+            ["vpn_fortinet_setup.md", "FAQ_connections.txt"],
+        )
+        self.assertIn("Шаги выполнены.", result)
+        self.assertIn("Использованные документы:", result)
+        self.assertIn("- vpn_fortinet_setup.md", result)
+        self.assertIn("- FAQ_connections.txt", result)
+
+    def test_dedupes_sources_in_footer(self):
+        result = append_sources_to_answer("OK", ["vpn.md", "faq.txt", "vpn.md"])
+        self.assertEqual(result.count("- vpn.md"), 1)
+
+
+class ChunkTextPreviewTests(unittest.TestCase):
+    def test_collapses_newlines(self):
+        preview = chunk_text_preview("line one\nline two", max_chars=120)
+        self.assertEqual(preview, "line one line two")
+
+    def test_truncates_long_text(self):
+        preview = chunk_text_preview("a" * 200, max_chars=120)
+        self.assertEqual(len(preview), 123)
+        self.assertTrue(preview.endswith("..."))
 
 
 class DistanceToRelevanceScoreTests(unittest.TestCase):

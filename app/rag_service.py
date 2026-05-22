@@ -21,6 +21,85 @@ class RagAnswer:
     response_time_ms: int
 
 
+def dedupe_sources(sources: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in sources:
+        source = (raw or "").strip()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        result.append(source)
+    return result
+
+
+def append_sources_to_answer(answer: str, sources: list[str]) -> str:
+    unique_sources = dedupe_sources(sources)
+    if not unique_sources:
+        return answer
+    lines = ["Использованные документы:"]
+    lines.extend(f"- {source}" for source in unique_sources)
+    block = "\n".join(lines)
+    body = (answer or "").rstrip()
+    if not body:
+        return block
+    return f"{body}\n\n{block}"
+
+
+CHUNK_PREVIEW_MAX_CHARS = 120
+
+
+def chunk_text_preview(text: str, max_chars: int = CHUNK_PREVIEW_MAX_CHARS) -> str:
+    safe = mask_sensitive_data(text or "")
+    one_line = " ".join(safe.split())
+    if len(one_line) <= max_chars:
+        return one_line
+    return one_line[:max_chars] + "..."
+
+
+def build_retrieval_results_for_log(
+    docs: list[str],
+    metadatas: list[dict[str, Any]],
+    distances: list[float | None],
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """One entry per raw Chroma hit (query order), for INFO logs and runtime_events."""
+    retrieval_results: list[dict[str, Any]] = []
+    for idx, doc in enumerate(docs):
+        meta = metadatas[idx] if idx < len(metadatas) else {}
+        distance = distances[idx] if idx < len(distances) else None
+        relevance_score = distance_to_relevance_score(distance)
+        accepted = relevance_score >= threshold
+        source = meta.get("source", "unknown")
+        section = meta.get("section", "") or ""
+        preview = chunk_text_preview(doc)
+
+        logger.info(
+            "RAG chunk result. rank=%s accepted=%s source=%s section=%r distance=%s "
+            "relevance_score=%.3f threshold=%.3f preview=%r",
+            idx + 1,
+            accepted,
+            source,
+            section,
+            distance,
+            relevance_score,
+            threshold,
+            preview,
+        )
+        retrieval_results.append(
+            {
+                "rank": idx + 1,
+                "accepted": accepted,
+                "source": source,
+                "section": section,
+                "distance": distance,
+                "relevance_score": relevance_score,
+                "preview": preview,
+            }
+        )
+    return retrieval_results
+
+
 def distance_to_relevance_score(distance: float | None) -> float:
     if distance is None:
         return 0.0
@@ -148,8 +227,12 @@ class RagService:
 
         try:
             docs, metadatas, distances = self._query_chroma(question)
+            threshold = settings.min_relevance_score
             accepted_results, rejected_results = filter_chunks_by_relevance(
-                docs, metadatas, distances
+                docs, metadatas, distances, threshold=threshold
+            )
+            retrieval_results = build_retrieval_results_for_log(
+                docs, metadatas, distances, threshold
             )
 
             logger.info(
@@ -157,7 +240,7 @@ class RagService:
                 len(docs),
                 len(accepted_results),
                 len(rejected_results),
-                settings.min_relevance_score,
+                threshold,
             )
 
             if len(docs) > 0 and len(accepted_results) == 0:
@@ -165,11 +248,11 @@ class RagService:
                     "RAG search returned chunks, but all were below relevance threshold. "
                     "raw_results=%s threshold=%.3f",
                     len(docs),
-                    settings.min_relevance_score,
+                    threshold,
                 )
 
             contexts = [format_context_for_model(item) for item in accepted_results]
-            sources = [item["source"] for item in accepted_results]
+            sources = dedupe_sources([item["source"] for item in accepted_results])
             found = len(accepted_results) > 0
             elapsed = int((time.monotonic() - started) * 1000)
 
@@ -189,8 +272,9 @@ class RagService:
                     "raw_chunks": len(docs),
                     "accepted_chunks": len(accepted_results),
                     "rejected_chunks": len(rejected_results),
-                    "min_relevance_score": settings.min_relevance_score,
+                    "min_relevance_score": threshold,
                     "accepted_sources": sources,
+                    "retrieval_results": retrieval_results,
                     "elapsed_ms": elapsed,
                 },
             )
@@ -222,7 +306,7 @@ class RagService:
                     "distance": item["distance"],
                     "relevance_score": item["relevance_score"],
                     "accepted": True,
-                    "text_preview": (item["document"] or "")[:300],
+                    "text_preview": chunk_text_preview(item["document"] or "", max_chars=300),
                 }
             )
         for item in rejected_results:
@@ -233,7 +317,7 @@ class RagService:
                     "distance": item["distance"],
                     "relevance_score": item["relevance_score"],
                     "accepted": False,
-                    "text_preview": (item["document"] or "")[:300],
+                    "text_preview": chunk_text_preview(item["document"] or "", max_chars=300),
                 }
             )
         return debug_rows
@@ -281,6 +365,7 @@ class RagService:
             )
 
             answer = response.choices[0].message.content or ""
+            answer = append_sources_to_answer(answer, sources)
             elapsed = int((time.monotonic() - started) * 1000)
 
             logger.info("Answer generated. elapsed_ms=%s, sources=%s", elapsed, sources)
