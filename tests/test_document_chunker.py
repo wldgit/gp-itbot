@@ -88,6 +88,10 @@ class DocumentChunkerTests(unittest.TestCase):
         self.assertIn("Если не получилось", joined)
 
     def test_trailing_small_buffer_merges_with_previous(self):
+        """Короткий финальный раздел (< SECTION_MIN_CHUNK_TOKENS) вливается в предыдущий чанк.
+
+        Не зависит от конкретного значения порога в .env: проверяем поведение, а не число чанков.
+        """
         paragraph = "Текст шага настройки с подробным описанием действий. " * 12
         text = (
             "# Инструкция\n\n"
@@ -96,12 +100,33 @@ class DocumentChunkerTests(unittest.TestCase):
             f"## Раздел 3\n\n{paragraph}\n\n"
             "## Хвост\n\nКороткий финальный раздел."
         )
+        profile = _profile("sections", 700, 100)
+        filename = "guide.md"
+        min_tokens = settings.section_min_chunk_tokens
 
-        chunks = chunk_document(text, "guide.md", _profile("sections", 700, 100))
+        chunks = chunk_document(text, filename, profile)
 
-        self.assertEqual(len(chunks), 1)
-        self.assertIn("Хвост", chunks[0].text)
-        self.assertIn("Раздел 3", chunks[0].text)
+        self.assertGreater(len(chunks), 0)
+        joined = "\n".join(chunk.text for chunk in chunks)
+        for label in ("Раздел 1", "Раздел 2", "Раздел 3", "Хвост", "Короткий финальный раздел"):
+            self.assertIn(label, joined, msg=f"missing {label!r} with min_tokens={min_tokens}")
+
+        last = chunks[-1]
+        self.assertIn("Раздел 3", last.text)
+        self.assertIn("Хвост", last.text)
+        self.assertIn("Короткий финальный раздел", last.text)
+
+        # Хвост не должен остаться отдельным чанком без «Раздел 3» (слияние при flush(final=True)).
+        orphan_tail_chunks = [
+            chunk
+            for chunk in chunks
+            if "Короткий финальный раздел" in chunk.text and "Раздел 3" not in chunk.text
+        ]
+        self.assertEqual(
+            orphan_tail_chunks,
+            [],
+            msg=f"tail section was not merged into previous chunk (min_tokens={min_tokens})",
+        )
 
     def test_troubleshooting_blocks_merges_short_sections(self):
         text = (
